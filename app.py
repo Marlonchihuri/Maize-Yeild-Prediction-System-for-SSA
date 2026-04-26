@@ -19,6 +19,7 @@ import lime.lime_tabular
 import joblib
 import json
 import os
+import pickle
 import warnings
 from datetime import date, datetime
 warnings.filterwarnings("ignore")
@@ -81,6 +82,12 @@ def load_model_artifacts():
         return model, scaler, feat_names
     except FileNotFoundError as e:
         st.error(f"⚠️ Model artifacts not found. Run phase4_5_train.py first.\n{e}")
+        st.stop()
+    except (ModuleNotFoundError, pickle.UnpicklingError, ImportError) as e:
+        st.error(f"⚠️ Error loading model artifacts. Ensure scikit-learn and xgboost are installed.\n{e}")
+        st.stop()
+    except Exception as e:
+        st.error(f"⚠️ Unexpected error loading model artifacts:\n{e}")
         st.stop()
 
 
