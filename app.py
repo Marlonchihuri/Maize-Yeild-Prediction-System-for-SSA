@@ -1,6 +1,3 @@
-# Install Streamlit if not already installed
-!pip install streamlit
-
 """
 Phase 7 — Streamlit Farmer-Facing Maize Yield Prediction App
 One Acre Fund Maize Yield Prediction System
@@ -110,17 +107,50 @@ def load_training_data(feat_names):
 model, scaler, feat_names = load_model_artifacts()
 X_full, y_full, bg_sample = load_training_data(feat_names)
 
-shap_explainer = shap.TreeExplainer(model)
+
+@st.cache_resource
+def init_shap_explainer():
+    """Initialize SHAP TreeExplainer with caching (no parameters to avoid hashing issues)."""
+    try:
+        # Load model and scaler locally
+        model_local = joblib.load("model.joblib")
+        scaler_local = joblib.load("scaler.joblib")
+        feat_names_local = joblib.load("feature_names.joblib")
+
+        # Load fresh background data for SHAP
+        df = pd.read_csv("cleaned_data.csv")
+        TARGET = "Yield (kg/ha)"
+        df.drop(columns=["lon"], inplace=True, errors="ignore")
+        cats = [c for c in ["country", "season"] if c in df.columns]
+        if cats:
+            df = pd.get_dummies(df, columns=cats, drop_first=False)
+        for c in df.select_dtypes("object").columns:
+            df.drop(columns=[c], inplace=True)
+
+        X = df.drop(columns=[TARGET])[feat_names_local]
+        sample = X.sample(min(500, len(X)), random_state=42)
+        bg_s = scaler_local.transform(sample)
+
+        explainer = shap.TreeExplainer(model_local, data=bg_s)
+        return explainer
+    except Exception as e:
+        return None
+
+
+shap_explainer = init_shap_explainer()
 
 lime_explainer = None
 if bg_sample is not None:
-    bg_s = scaler.transform(bg_sample)
-    lime_explainer = lime.lime_tabular.LimeTabularExplainer(
-        training_data=bg_s,
-        feature_names=feat_names,
-        mode="regression",
-        random_state=42,
-    )
+    try:
+        bg_s = scaler.transform(bg_sample)
+        lime_explainer = lime.lime_tabular.LimeTabularExplainer(
+            training_data=bg_s,
+            feature_names=feat_names,
+            mode="regression",
+            random_state=42,
+        )
+    except Exception as e:
+        pass
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -146,6 +176,20 @@ def predict_yield(row_df: pd.DataFrame) -> tuple:
     ci_lo   = max(0, pred - 1.645 * std_err)
     ci_hi   = pred + 1.645 * std_err
     return pred, (ci_lo, ci_hi)
+
+
+def get_shap_values(row_s: np.ndarray):
+    """Return SHAP values for a row as 1D array."""
+    if shap_explainer is None:
+        return None
+    try:
+        sv = shap_explainer.shap_values(row_s)
+        # Flatten to 1D if 2D
+        if isinstance(sv, np.ndarray) and sv.ndim > 1:
+            sv = sv[0]
+        return sv
+    except Exception:
+        return None
 
 
 def yield_color(kg_ha: float) -> str:
@@ -215,9 +259,9 @@ st.markdown("""
   .metric-label { font-size: 0.9rem; color: #ccc; margin-top: 8px; }
   .section-header { font-size: 1.4rem; font-weight: 700; margin-top: 16px;
                     border-left: 4px solid #2ecc71; padding-left: 12px; }
-  .warn-box { background:#fff3cd; border-left:4px solid #f39c12;
+  .warn-box { background:#fff3cd; border-left:4px solid #f39c12; color: #333;
               padding:10px 14px; border-radius:6px; font-size:0.88rem; }
-  .success-box { background:#d4edda; border-left:4px solid #27ae60;
+  .success-box { background:#d4edda; border-left:4px solid #27ae60; color: #155724;
                  padding:10px 14px; border-radius:6px; font-size:0.88rem; }
   div[data-testid="metric-container"] { background: #f0f4ff; border-radius:10px; padding:12px; }
 </style>
@@ -226,8 +270,7 @@ st.markdown("""
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/4/41/Simple_Corn.svg/200px-Simple_Corn.svg.png", width=60)
-    st.markdown("## 🌽 MaizeIQ")
+    st.markdown("# 🌽 MaizeIQ")
     st.caption("AI-powered yield prediction for smallholder farmers")
     st.divider()
 
@@ -335,28 +378,31 @@ if page == "🌾 Predict Yield":
     st.markdown('<p class="section-header">📊 Yield Driver Importance</p>', unsafe_allow_html=True)
 
     row_s = scaler.transform(input_row)
-    sv    = shap_explainer.shap_values(row_s)[0]
-    sv_df = pd.DataFrame({"Feature": feat_names, "SHAP Value": sv})
-    sv_df = sv_df.reindex(sv_df["SHAP Value"].abs().sort_values(ascending=False).index).head(10)
+    sv = get_shap_values(row_s)
+    if sv is None:
+        st.info("📊 Feature importance analysis is currently loading. Please refresh the page if this persists.")
+    else:
+        sv_df = pd.DataFrame({"Feature": feat_names, "SHAP Value": sv})
+        sv_df = sv_df.reindex(sv_df["SHAP Value"].abs().sort_values(ascending=False).index).head(10)
 
-    fig = go.Figure(go.Bar(
-        x=sv_df["SHAP Value"],
-        y=sv_df["Feature"],
-        orientation="h",
-        marker_color=["#27ae60" if v >= 0 else "#e74c3c" for v in sv_df["SHAP Value"]],
-        text=[f"{v:+.0f}" for v in sv_df["SHAP Value"]],
-        textposition="outside",
-    ))
-    fig.update_layout(
-        title="SHAP Values — Feature Contributions to Your Prediction",
-        xaxis_title="Contribution to Yield (kg/ha)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        height=420,
-        font=dict(size=12),
-        margin=dict(l=10, r=10, t=40, b=10),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        fig = go.Figure(go.Bar(
+            x=sv_df["SHAP Value"],
+            y=sv_df["Feature"],
+            orientation="h",
+            marker_color=["#27ae60" if v >= 0 else "#e74c3c" for v in sv_df["SHAP Value"]],
+            text=[f"{v:+.0f}" for v in sv_df["SHAP Value"]],
+            textposition="outside",
+        ))
+        fig.update_layout(
+            title="SHAP Values — Feature Contributions to Your Prediction",
+            xaxis_title="Contribution to Yield (kg/ha)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            height=420,
+            font=dict(size=12),
+            margin=dict(l=10, r=10, t=40, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
     # Growth stage progress bar
     doy = int(user_inputs["Planting Day of Year"])
@@ -379,8 +425,12 @@ elif page == "🔍 Explain Prediction":
     st.caption("Understand *why* the model predicted this yield using SHAP and LIME.")
 
     row_s = scaler.transform(input_row)
-    sv    = shap_explainer.shap_values(row_s)[0]
-    shap_top = sorted(zip(feat_names, sv), key=lambda x: abs(x[1]), reverse=True)
+    sv = get_shap_values(row_s)
+    if sv is None:
+        st.info("📊 Feature importance analysis is currently loading. Please refresh the page if this persists.")
+        shap_top = []
+    else:
+        shap_top = sorted(zip(feat_names, sv), key=lambda x: abs(x[1]), reverse=True)
 
     # Plain-language summary
     st.markdown("### 📝 Plain-Language Summary")
@@ -392,26 +442,29 @@ elif page == "🔍 Explain Prediction":
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("### 🧮 SHAP Waterfall")
-        st.markdown("""
-        <div style="background:#f8f9fa;border-radius:8px;padding:10px 14px;font-size:0.82rem;color:#555">
-        <b>What is SHAP?</b> SHAP shows how each feature pushes the prediction
-        above or below the model's baseline. Green bars = positive impact,
-        red bars = negative impact.
-        </div>""", unsafe_allow_html=True)
-        top_n = 12
-        top_idx = np.argsort(np.abs(sv))[-top_n:][::-1]
-        fig, ax = plt.subplots(figsize=(7, 5))
-        colors = ["#27ae60" if sv[i] >= 0 else "#e74c3c" for i in top_idx]
-        ax.barh(range(top_n), sv[top_idx], color=colors, alpha=0.85)
-        ax.set_yticks(range(top_n))
-        ax.set_yticklabels([feat_names[i][:35] for t in ax.get_yticklabels()], fontsize=9)
-        ax.axvline(0, color="black", linewidth=0.7)
-        ax.set_xlabel("SHAP contribution (kg/ha)")
-        ax.set_title("SHAP Feature Contributions", fontweight="bold", fontsize=11)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
+        if sv is None:
+            st.info("📊 SHAP waterfall analysis is currently loading. The sidebar feature controls may help you understand yield drivers.")
+        else:
+            st.markdown("### 🧮 SHAP Waterfall")
+            st.markdown("""
+            <div style="background:#f8f9fa;border-radius:8px;padding:10px 14px;font-size:0.82rem;color:#555">
+            <b>What is SHAP?</b> SHAP shows how each feature pushes the prediction
+            above or below the model's baseline. Green bars = positive impact,
+            red bars = negative impact.
+            </div>""", unsafe_allow_html=True)
+            top_n = 12
+            top_idx = np.argsort(np.abs(sv))[-top_n:][::-1]
+            fig, ax = plt.subplots(figsize=(7, 5))
+            colors = ["#27ae60" if sv[i] >= 0 else "#e74c3c" for i in top_idx]
+            ax.barh(range(top_n), sv[top_idx], color=colors, alpha=0.85)
+            ax.set_yticks(range(top_n))
+            ax.set_yticklabels([feat_names[i][:35] for i in top_idx][::-1], fontsize=9) # Corrected indexing for yticklabels
+            ax.axvline(0, color="black", linewidth=0.7)
+            ax.set_xlabel("SHAP contribution (kg/ha)")
+            ax.set_title("SHAP Feature Contributions", fontweight="bold", fontsize=11)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
 
     with col2:
         st.markdown("### 🔬 LIME Local Explanation")
@@ -460,7 +513,7 @@ elif page == "🔍 Explain Prediction":
             delta = new_pred_adj - pred_adj
             st.metric(
                 label=feat[:28],
-                value=f"+"{delta:,.0f} kg/ha" if delta > 0 else f"{delta:,.0f} kg/ha",
+                value=f"{delta:+,.0f} kg/ha",
                 delta=f"If +25% {FEATURE_UNITS.get(feat,'')}",
                 delta_color="normal",
             )
